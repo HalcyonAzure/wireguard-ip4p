@@ -7,6 +7,7 @@ package conf
 
 import (
 	"log"
+	"net"
 	"net/netip"
 	"time"
 	"unsafe"
@@ -82,13 +83,59 @@ func resolveHostnameOnce(name string) (resolvedIPString string, err error) {
 	return
 }
 
+func resolveHostnameIP4P(name string) (*Endpoint, error) {
+    hints := windows.AddrinfoW{
+        Family:   windows.AF_UNSPEC,
+        Socktype: windows.SOCK_DGRAM,
+        Protocol: windows.IPPROTO_IP,
+    }
+    var result *windows.AddrinfoW
+    name16, err := windows.UTF16PtrFromString(name)
+    if err != nil {
+        return nil, err
+    }
+    err = windows.GetAddrInfoW(name16, nil, &hints, &result)
+    if err != nil {
+        return nil, err
+    }
+    if result == nil {
+        return nil, windows.WSAHOST_NOT_FOUND
+    }
+    defer windows.FreeAddrInfoW(result)
+
+    // Loop through all results, looking specifically for IPv6 addresses that conform to IP4P encoding
+    for ; result != nil; result = result.Next {
+        if result.Family == windows.AF_INET6 {
+            addr := (*winipcfg.RawSockaddrInet)(unsafe.Pointer(result.Addr)).Addr()
+            if addr.Is6() {
+                ipv6 := addr.As16()
+                // Check if the address starts with 2001:0000
+                if ipv6[0] == 0x20 && ipv6[1] == 0x01 && ipv6[2] == 0x00 && ipv6[3] == 0x00 {
+                    // Extract IPv4 and port from the special IPv6 format
+                    ipv4 := net.IPv4(ipv6[12], ipv6[13], ipv6[14], ipv6[15])
+                    port := (uint16(ipv6[10]) << 8) + uint16(ipv6[11])
+                    return &Endpoint{Host: ipv4.String(), Port: port}, nil
+                }
+            }
+        }
+    }
+    return nil, windows.WSAHOST_NOT_FOUND // No suitable IPv6 format found
+}
+
 func (config *Config) ResolveEndpoints() error {
 	for i := range config.Peers {
 		if config.Peers[i].Endpoint.IsEmpty() {
 			continue
 		}
 		var err error
-		config.Peers[i].Endpoint.Host, err = resolveHostname(config.Peers[i].Endpoint.Host)
+        // if Endpoint's Port equl to 1234, then resolveHostnameIP4P will be called
+        if config.Peers[i].Endpoint.Port == 1234 {
+            var resolvedEndpoint *Endpoint
+            resolvedEndpoint, err = resolveHostnameIP4P(config.Peers[i].Endpoint.Host)
+            config.Peers[i].Endpoint = *resolvedEndpoint
+        } else {
+            config.Peers[i].Endpoint.Host, err = resolveHostname(config.Peers[i].Endpoint.Host)
+        }
 		if err != nil {
 			return err
 		}
